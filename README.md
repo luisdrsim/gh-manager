@@ -11,6 +11,26 @@ A terminal CLI for managing multiple GitHub accounts via the [`gh`](https://cli.
 - Assign an account to a directory via `.envrc` + [direnv](https://direnv.net/)
 - Works as a direct subcommand: `ghm switch <username>`
 
+## Languages
+
+`ghm` detects the language automatically from your system locale (`$LANG`). Supported languages:
+
+| Code | Language   |
+|------|------------|
+| `en` | English    |
+| `es` | Español    |
+| `fr` | Français   |
+| `de` | Deutsch    |
+| `pt` | Português  |
+| `it` | Italiano   |
+
+Override the language at any time with the `GHM_LANG` environment variable:
+
+```bash
+GHM_LANG=fr ghm          # use French for this run
+export GHM_LANG=es        # set Spanish as default in your shell
+```
+
 ## Requirements
 
 - macOS or Linux
