@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# gh-manager — Gestión de cuentas GitHub (gh CLI)
+#
+# Uso:
+#   ghm                  → menú principal
+#   ghm status           → estado rápido
+#   ghm switch           → cambiar cuenta activa
+#   ghm switch <usuario> → activar cuenta directamente
+#   ghm help             → ayuda
+
+set -euo pipefail
+
+GHM_VERSION="1.0.0"
+
+# ── Colores ───────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Helpers de UI ─────────────────────────────────────────────
+ok()     { echo -e "  ${GREEN}✅${RESET}  $*"; }
+warn()   { echo -e "  ${YELLOW}⚠️  $*${RESET}"; }
+err()    { echo -e "  ${RED}❌${RESET}  $*"; }
+info()   { echo -e "  ${CYAN}ℹ️  $*${RESET}"; }
+step()   { echo -e "  ${BLUE}👉${RESET}  $*"; }
+secret() { echo -e "  ${MAGENTA}🔐${RESET}  $*"; }
+
+print_separator() { echo -e "${DIM}  ──────────────────────────────────────────────${RESET}"; }
+
+pause() {
+  echo ""
+  read -rp "  $(echo -e "${DIM}Pulsa Enter para volver al menú...${RESET}")" _
+}
+
+confirm() {
+  local msg="${1:-¿Confirmar?}"
+  echo ""
+  read -rp "  $(echo -e "${YELLOW}❓${RESET} ${msg} [s/N]: ")" ans
+  [[ "$ans" =~ ^[sS]$ ]]
+}
+
+# ── Comprobaciones previas ────────────────────────────────────
+check_gh() {
+  if ! command -v gh &>/dev/null; then
+    echo ""
+    err "No se encontró el comando ${BOLD}gh${RESET}."
+    info "Instálalo con:  ${BOLD}brew install gh${RESET}"
+    echo ""
+    exit 1
+  fi
+}
+
+# ── Datos de cuentas ──────────────────────────────────────────
+get_active_account() {
+  gh auth status 2>&1 \
+    | awk '
+        /Active account: true/ { found=1; next }
+        found && /Logged in to/ {
+          gsub(/.*account /, ""); gsub(/ .*/, ""); print; found=0
+        }
+      ' | head -1
+}
+
+get_all_accounts() {
+  gh auth status 2>&1 \
+    | grep "Logged in to github.com account" \
+    | sed 's/.*account \([^ ]*\).*/\1/'
+}
+
+get_account_count() {
+  get_all_accounts | wc -l | tr -d ' '
+}
+
+get_token_scopes() {
+  local user="$1"
+  gh auth status --hostname github.com 2>&1 \
+    | awk -v u="$user" '
+        $0 ~ ("account " u) { found=1 }
+        found && /Token scopes/ {
+          gsub(/.*Token scopes: /, ""); print; found=0
+        }
+      '
+}
+
+# ── Header principal ──────────────────────────────────────────
+print_header() {
+  clear
+  local active
+  active=$(get_active_account 2>/dev/null || echo "—")
+  local count
+  count=$(get_account_count 2>/dev/null || echo "0")
+  local plural=""
+  [[ "$count" != "1" ]] && plural="s"
+
+  echo ""
+  echo -e "${BOLD}${BLUE}  🐙 gh-manager${RESET}  ${DIM}·  GitHub CLI · Gestión de cuentas${RESET}"
+  print_separator
+  echo -e "  👤  Cuenta activa:  ${BOLD}${GREEN}${active}${RESET}   ${DIM}(${count} cuenta${plural} autenticada${plural})${RESET}"
+  print_separator
+  echo ""
+}
+
+print_section_header() {
+  local icon="$1"
+  local title="$2"
+  clear
+  echo ""
+  echo -e "${BOLD}${BLUE}  🐙 gh-manager${RESET}  ${DIM}›  ${icon} ${title}${RESET}"
+  print_separator
+  echo ""
+}
+
+# ── Selector reutilizable de cuenta ──────────────────────────
+PICKED_ACCOUNT=""
+
+pick_account() {
+  local title="${1:-Selecciona una cuenta}"
+  PICKED_ACCOUNT=""
+
+  mapfile -t accounts < <(get_all_accounts)
+
+  if [[ ${#accounts[@]} -eq 0 ]]; then
+    warn "No hay cuentas autenticadas."
+    return 1
+  fi
+
+  local active
+  active=$(get_active_account 2>/dev/null || echo "")
+
+  echo -e "  ${BOLD}${title}${RESET}"
+  echo ""
+
+  local i=1
+  for acc in "${accounts[@]}"; do
+    if [[ "$acc" == "$active" ]]; then
+      echo -e "    ${GREEN}${BOLD}$i)${RESET}  🟢  ${BOLD}$acc${RESET}  ${DIM}← activa${RESET}"
+    else
+      echo -e "    ${CYAN}$i)${RESET}  ⚪  $acc"
+    fi
+    ((i++))
+  done
+  echo -e "    ${DIM}0)  ↩️  Cancelar${RESET}"
+  echo ""
+
+  local choice
+  read -rp "  $(echo -e "${BOLD}Opción:${RESET} ")" choice
+
+  if [[ "$choice" == "0" || -z "$choice" ]]; then
+    return 1
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#accounts[@]} )); then
+    err "Opción no válida."
+    sleep 1
+    return 1
+  fi
+
+  PICKED_ACCOUNT="${accounts[$((choice-1))]}"
+}
+
+# ─────────────────────────────────────────────────────────────
+#  1. Estado detallado
+# ─────────────────────────────────────────────────────────────
+show_status() {
+  print_section_header "📊" "Estado de las cuentas"
+
+  local active
+  active=$(get_active_account 2>/dev/null || echo "—")
+  mapfile -t accounts < <(get_all_accounts)
+
+  if [[ ${#accounts[@]} -eq 0 ]]; then
+    warn "No hay ninguna cuenta autenticada todavía."
+    info "Ve a ${BOLD}➕ Añadir nueva cuenta${RESET} para empezar."
+    pause; return
+  fi
+
+  for acc in "${accounts[@]}"; do
+    if [[ "$acc" == "$active" ]]; then
+      echo -e "  ${GREEN}${BOLD}  🟢 $acc${RESET}  ${DIM}← activa${RESET}"
+    else
+      echo -e "  ⚪  ${BOLD}$acc${RESET}"
+    fi
+    local scopes
+    scopes=$(get_token_scopes "$acc" 2>/dev/null || echo "—")
+    echo -e "${DIM}       Scopes: ${scopes}${RESET}"
+    echo ""
+  done
+
+  print_separator
+  echo ""
+  info "Salida completa de ${BOLD}gh auth status${RESET}:"
+  echo ""
+  gh auth status 2>&1 | sed 's/^/    /'
+  echo ""
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  2. Cambiar cuenta activa
+# ─────────────────────────────────────────────────────────────
+switch_account() {
+  local target="${1:-}"
+
+  print_section_header "🔄" "Cambiar cuenta activa"
+
+  local active
+  active=$(get_active_account 2>/dev/null || echo "")
+
+  if [[ -n "$target" ]]; then
+    mapfile -t all < <(get_all_accounts)
+    local found=0
+    for acc in "${all[@]}"; do [[ "$acc" == "$target" ]] && found=1 && break; done
+    if [[ $found -eq 0 ]]; then
+      err "La cuenta ${BOLD}$target${RESET} no está autenticada."
+      echo ""
+      info "Cuentas disponibles:"
+      for acc in "${all[@]}"; do echo "    • $acc"; done
+      pause; return
+    fi
+    if [[ "$target" == "$active" ]]; then
+      warn "La cuenta ${BOLD}$target${RESET} ya es la activa."
+      pause; return
+    fi
+    step "Activando ${BOLD}$target${RESET}..."
+    if gh auth switch --user "$target" &>/dev/null; then
+      echo ""
+      ok "¡Cuenta cambiada a ${BOLD}${GREEN}$target${RESET}!"
+    else
+      err "No se pudo cambiar de cuenta."
+    fi
+    pause; return
+  fi
+
+  if ! pick_account "¿A qué cuenta quieres cambiar?"; then
+    info "Cancelado."; sleep 1; return
+  fi
+
+  if [[ "$PICKED_ACCOUNT" == "$active" ]]; then
+    warn "La cuenta ${BOLD}$PICKED_ACCOUNT${RESET} ya es la activa."
+    pause; return
+  fi
+
+  echo ""
+  step "Activando ${BOLD}$PICKED_ACCOUNT${RESET}..."
+  if gh auth switch --user "$PICKED_ACCOUNT" &>/dev/null; then
+    echo ""
+    ok "¡Cuenta cambiada a ${BOLD}${GREEN}$PICKED_ACCOUNT${RESET}!"
+  else
+    err "No se pudo cambiar de cuenta."
+  fi
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  3. Añadir nueva cuenta
+# ─────────────────────────────────────────────────────────────
+add_account() {
+  print_section_header "➕" "Añadir nueva cuenta"
+
+  info "Se lanzará el flujo de autenticación de ${BOLD}gh${RESET}."
+  info "Cuando se abra el navegador, inicia sesión con la cuenta que quieres añadir."
+  echo ""
+  warn "Si tienes varias pestañas de GitHub abiertas, asegúrate de"
+  echo "       estar logueado con la cuenta correcta antes de continuar."
+  echo ""
+
+  confirm "¿Lanzar el flujo de autenticación?" || { info "Cancelado."; pause; return; }
+
+  echo ""
+  print_separator
+  echo ""
+  gh auth login --hostname github.com
+  echo ""
+  print_separator
+  echo ""
+  ok "Proceso completado."
+  echo ""
+  info "Cuentas autenticadas ahora:"
+  echo ""
+  mapfile -t accounts < <(get_all_accounts)
+  for acc in "${accounts[@]}"; do echo "    🐙 $acc"; done
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  4. Cerrar sesión de una cuenta
+# ─────────────────────────────────────────────────────────────
+logout_account() {
+  print_section_header "🚪" "Cerrar sesión de una cuenta"
+
+  if ! pick_account "¿De qué cuenta quieres cerrar sesión?"; then
+    info "Cancelado."; sleep 1; return
+  fi
+
+  local active
+  active=$(get_active_account 2>/dev/null || echo "")
+
+  echo ""
+  if [[ "$PICKED_ACCOUNT" == "$active" ]]; then
+    warn "${BOLD}$PICKED_ACCOUNT${RESET} es la cuenta activa en este momento."
+    info "Si la eliminas, gh podría quedarse sin cuenta activa."
+  fi
+
+  confirm "¿Cerrar sesión de ${BOLD}$PICKED_ACCOUNT${RESET}?" || { info "Cancelado."; pause; return; }
+
+  echo ""
+  step "Cerrando sesión de ${BOLD}$PICKED_ACCOUNT${RESET}..."
+  if gh auth logout --hostname github.com --user "$PICKED_ACCOUNT" 2>&1 | sed 's/^/  /'; then
+    echo ""
+    ok "Sesión cerrada para ${BOLD}$PICKED_ACCOUNT${RESET}."
+  else
+    err "No se pudo cerrar la sesión."
+  fi
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  5. Ver y copiar token
+# ─────────────────────────────────────────────────────────────
+show_token() {
+  print_section_header "🔑" "Token de autenticación"
+
+  if ! pick_account "¿De qué cuenta quieres ver el token?"; then
+    info "Cancelado."; sleep 1; return
+  fi
+
+  echo ""
+  secret "Los tokens son ${BOLD}credenciales sensibles${RESET}. No los compartas."
+  echo ""
+  print_separator
+  echo ""
+
+  local token
+  token=$(gh auth token --user "$PICKED_ACCOUNT" 2>&1)
+
+  echo -e "  👤  ${BOLD}Cuenta:${RESET}  $PICKED_ACCOUNT"
+  echo -e "  🔑  ${BOLD}Token:${RESET}   ${DIM}${token}${RESET}"
+  echo ""
+  print_separator
+  echo ""
+
+  if command -v pbcopy &>/dev/null; then
+    confirm "¿Copiar el token al portapapeles? 📋" && {
+      echo -n "$token" | pbcopy
+      echo ""
+      ok "Token copiado al portapapeles."
+    }
+  fi
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  6. Comprobar y refrescar autenticación
+# ─────────────────────────────────────────────────────────────
+refresh_auth() {
+  print_section_header "🔁" "Comprobar y refrescar autenticación"
+
+  info "Verifica que todos los tokens siguen siendo válidos contra la API de GitHub."
+  echo ""
+
+  mapfile -t accounts < <(get_all_accounts)
+
+  if [[ ${#accounts[@]} -eq 0 ]]; then
+    warn "No hay cuentas autenticadas."
+    pause; return
+  fi
+
+  local all_ok=true
+  for acc in "${accounts[@]}"; do
+    echo -ne "  🔍  Comprobando ${BOLD}$acc${RESET}..."
+    if gh api user --hostname github.com \
+         -H "Authorization: token $(gh auth token --user "$acc" 2>/dev/null)" \
+         &>/dev/null 2>&1; then
+      echo -e "  ${GREEN}✅ Token válido${RESET}"
+    else
+      echo -e "  ${RED}❌ Token inválido o expirado${RESET}"
+      all_ok=false
+      echo ""
+      confirm "¿Re-autenticar ${BOLD}$acc${RESET} ahora?" && {
+        echo ""
+        gh auth login --hostname github.com
+      }
+    fi
+  done
+
+  echo ""
+  $all_ok && ok "Todos los tokens están en orden. 🎉" || warn "Algunos tokens pueden necesitar renovación."
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  7. Asignar cuenta a directorio (.envrc)
+# ─────────────────────────────────────────────────────────────
+set_envrc() {
+  print_section_header "📁" "Asignar cuenta a directorio (.envrc)"
+
+  local cwd
+  cwd=$(pwd)
+
+  info "Crea o actualiza ${BOLD}.envrc${RESET} en el directorio actual."
+  info "Con ${BOLD}direnv${RESET}, la cuenta se activa automáticamente al entrar en él."
+  echo ""
+  echo -e "  📂  Directorio actual:  ${BOLD}${cwd}${RESET}"
+  echo ""
+
+  if ! pick_account "¿Qué cuenta quieres asignar a este directorio?"; then
+    info "Cancelado."; sleep 1; return
+  fi
+
+  local envrc_file="${cwd}/.envrc"
+
+  if [[ -f "$envrc_file" ]]; then
+    sed -i '' '/^export GH_USER=/d' "$envrc_file" 2>/dev/null \
+      || sed -i '/^export GH_USER=/d' "$envrc_file"
+    info "Actualizando ${BOLD}.envrc${RESET} existente."
+  else
+    info "Creando ${BOLD}.envrc${RESET} nuevo."
+  fi
+
+  echo "export GH_USER=$PICKED_ACCOUNT" >> "$envrc_file"
+  echo ""
+  ok "Añadido:  ${BOLD}export GH_USER=$PICKED_ACCOUNT${RESET}  →  .envrc"
+
+  if command -v direnv &>/dev/null; then
+    echo ""
+    step "Ejecutando ${BOLD}direnv allow${RESET}..."
+    direnv allow . 2>&1 | sed 's/^/  /' || true
+    echo ""
+    ok "direnv actualizado correctamente."
+  else
+    echo ""
+    warn "direnv no está instalado."
+    info "Instálalo con:  ${BOLD}brew install direnv${RESET}"
+    info "Y añade a tu .zprofile:  ${BOLD}eval \"\$(direnv hook zsh)\"${RESET}"
+  fi
+  pause
+}
+
+# ─────────────────────────────────────────────────────────────
+#  Subcomando: status rápido
+# ─────────────────────────────────────────────────────────────
+show_quick_status() {
+  local active
+  active=$(get_active_account 2>/dev/null || echo "ninguna")
+
+  echo ""
+  echo -e "${BOLD}${BLUE}  🐙 gh-manager · Estado rápido${RESET}"
+  print_separator
+
+  if [[ "$active" == "ninguna" ]]; then
+    warn "No hay ninguna cuenta autenticada."
+    echo ""; exit 1
+  fi
+
+  echo -e "  👤  ${BOLD}Cuenta activa:${RESET}  ${GREEN}${BOLD}${active}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Cuentas autenticadas:${RESET}"
+  mapfile -t accounts < <(get_all_accounts)
+  for acc in "${accounts[@]}"; do
+    if [[ "$acc" == "$active" ]]; then
+      echo -e "    ${GREEN}●${RESET}  ${BOLD}$acc${RESET}  ${DIM}(activa)${RESET}"
+    else
+      echo -e "    ${DIM}○${RESET}  $acc"
+    fi
+  done
+  echo ""
+  print_separator
+  echo ""
+}
+
+# ─────────────────────────────────────────────────────────────
+#  Subcomando: ayuda
+# ─────────────────────────────────────────────────────────────
+show_help() {
+  echo ""
+  echo -e "${BOLD}${BLUE}  🐙 gh-manager${RESET}  ${DIM}·  GitHub CLI · Gestión de cuentas${RESET}"
+  print_separator
+  echo ""
+  echo -e "  ${BOLD}Uso:${RESET}"
+  echo ""
+  echo "    ghm                    → Abre el menú interactivo"
+  echo "    ghm status             → Muestra la cuenta activa y la lista"
+  echo "    ghm switch             → Menú para cambiar de cuenta"
+  echo "    ghm switch <usuario>   → Activa directamente una cuenta"
+  echo "    ghm version            → Muestra la versión instalada"
+  echo "    ghm help               → Muestra esta ayuda"
+  echo ""
+  print_separator
+  echo ""
+}
+
+# ─────────────────────────────────────────────────────────────
+#  Menú principal
+# ─────────────────────────────────────────────────────────────
+main_menu() {
+  while true; do
+    print_header
+
+    echo -e "  ${BOLD}¿Qué quieres hacer?${RESET}"
+    echo ""
+    echo -e "  ${DIM}── Cuentas ───────────────────────────────────${RESET}"
+    echo "    1)  📊  Ver estado detallado de las cuentas"
+    echo "    2)  🔄  Cambiar cuenta activa"
+    echo "    3)  ➕  Añadir nueva cuenta"
+    echo "    4)  🚪  Cerrar sesión de una cuenta"
+    echo ""
+    echo -e "  ${DIM}── Herramientas ──────────────────────────────${RESET}"
+    echo "    5)  🔑  Ver / copiar token de una cuenta"
+    echo "    6)  🔁  Comprobar y refrescar autenticación"
+    echo "    7)  📁  Asignar cuenta a directorio (.envrc)"
+    echo ""
+    print_separator
+    echo "    0)  👋  Salir"
+    echo ""
+    print_separator
+    echo ""
+
+    local option
+    read -rp "  $(echo -e "${BOLD}Opción:${RESET} ")" option
+
+    case "$option" in
+      1) show_status ;;
+      2) switch_account ;;
+      3) add_account ;;
+      4) logout_account ;;
+      5) show_token ;;
+      6) refresh_auth ;;
+      7) set_envrc ;;
+      0)
+        echo ""
+        echo -e "  👋  ${BOLD}¡Hasta luego!${RESET}"
+        echo ""
+        exit 0
+        ;;
+      *)
+        warn "Opción no válida. Elige entre 0 y 7."
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+# ─────────────────────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────────────────────
+check_gh
+
+case "${1:-}" in
+  status)           show_quick_status ;;
+  switch)           switch_account "${2:-}" ;;
+  version|--version|-v) echo "ghm v${GHM_VERSION}" ;;
+  help|--help|-h)   show_help ;;
+  "")               main_menu ;;
+  *)
+    err "Subcomando desconocido: ${BOLD}$1${RESET}"
+    show_help
+    exit 1
+    ;;
+esac
