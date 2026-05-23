@@ -42,13 +42,13 @@ export GHM_LANG=es        # set Spanish as default in your shell
 ### Via Homebrew
 
 ```bash
-brew install luisdrsim/gh-manager/ghm
+brew install lcajigasm/gh-manager/ghm
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/luisdrsim/gh-manager.git
+git clone https://github.com/lcajigasm/gh-manager.git
 cd gh-manager
 make install
 ```

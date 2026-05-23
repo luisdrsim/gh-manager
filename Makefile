@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "1.0.0")
-REPO    := luisdrsim/gh-manager
+REPO    := lcajigasm/gh-manager
 
 .PHONY: install uninstall release update-formula lint
 
